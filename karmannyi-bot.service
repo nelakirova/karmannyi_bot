@@ -1,0 +1,22 @@
+[Unit]
+Description=Karmannyi Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=karmannyi
+WorkingDirectory=/opt/karmannyi-bot
+ExecStart=/opt/karmannyi-bot/karmannyi-bot
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/opt/karmannyi-bot/.env
+
+# Небольшая защита: процесс не может писать за пределы своей директории,
+# кроме файла БД, который там же и лежит.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/karmannyi-bot
+
+[Install]
+WantedBy=multi-user.target

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"net/mail"
 	"os"
 	"strings"
@@ -16,21 +15,19 @@ import (
 )
 
 const (
-	productName  = "8–10 лет «Карманный воспитатель»"
-	productPrice = "99 ₽"
-
 	adminTelegramID int64 = 194229955
-
-	channelID int64 = -1004292539378
 )
 
 // Глобальный экземпляр Telegram-бота.
-// Он нужен webhookHandler, чтобы после успешной оплаты
-// отправить покупателю сообщение с invite-ссылкой.
+// Используется в startPaymentChecker/processSuccessfulPayment,
+// чтобы после подтверждения оплаты отправить покупателю
+// сообщение с invite-ссылкой.
 var botInstance *tgbotapi.BotAPI
 
-// Пользователи, от которых бот сейчас ожидает e-mail.
-var awaitingEmail = make(map[int64]bool)
+// Пользователи, от которых бот сейчас ожидает e-mail —
+// значение карты это ID выбранного курса (product.ID),
+// чтобы после получения e-mail знать, за что создавать платёж.
+var awaitingEmail = make(map[int64]string)
 
 func main() {
 	if err := godotenv.Load(); err != nil {
@@ -58,7 +55,8 @@ func main() {
 	}
 
 	// Сохраняем экземпляр бота глобально,
-	// чтобы его мог использовать webhookHandler.
+	// чтобы его могли использовать фоновые функции
+	// (startPaymentChecker / processSuccessfulPayment).
 	botInstance = bot
 
 	log.Printf("Бот запущен: @%s", bot.Self.UserName)
@@ -111,10 +109,10 @@ func handleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 	userID := message.From.ID
 
 	// --------------------------------------------------------
-	// Пользователь отправляет e-mail
+	// Пользователь отправляет e-mail для чека
 	// --------------------------------------------------------
 
-	if awaitingEmail[userID] {
+	if productID, ok := awaitingEmail[userID]; ok {
 		email := strings.TrimSpace(message.Text)
 
 		parsedEmail, err := mail.ParseAddress(email)
@@ -134,116 +132,15 @@ func handleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 			return
 		}
 
-		// Создаём заказ после получения корректного e-mail.
-		orderID, err := createOrder(userID)
-
-		if err != nil {
-			log.Println("Ошибка создания заказа:", err)
-
-			msg := tgbotapi.NewMessage(
-				message.Chat.ID,
-				"Не удалось создать заказ. Попробуйте ещё раз.",
-			)
-
-			if _, err := bot.Send(msg); err != nil {
-				log.Println("Ошибка отправки:", err)
-			}
-
-			return
-		}
-
-		// Сохраняем e-mail.
-		if err := updateOrderEmail(orderID, email); err != nil {
-			log.Println("Ошибка сохранения e-mail:", err)
-
-			msg := tgbotapi.NewMessage(
-				message.Chat.ID,
-				"Не удалось сохранить e-mail. Попробуйте ещё раз.",
-			)
-
-			if _, err := bot.Send(msg); err != nil {
-				log.Println("Ошибка отправки:", err)
-			}
-
-			return
-		}
-
-		// E-mail получен.
 		delete(awaitingEmail, userID)
 
-		// Создаём платёж ЮKassa.
-		payment, err := createYooKassaPayment(
-			orderID,
+		startCheckout(
+			bot,
+			message.Chat.ID,
+			userID,
+			productID,
 			email,
 		)
-
-		if err != nil {
-			log.Println(
-				"Ошибка создания платежа ЮKassa:",
-				err,
-			)
-
-			msg := tgbotapi.NewMessage(
-				message.Chat.ID,
-				"Не удалось создать платёж. 😔\n\n"+
-					"Попробуйте ещё раз через некоторое время.",
-			)
-
-			if _, err := bot.Send(msg); err != nil {
-				log.Println("Ошибка отправки:", err)
-			}
-
-			return
-		}
-
-		// Сохраняем ID платежа ЮKassa.
-		if err := updateYooKassaPaymentID(
-			orderID,
-			payment.ID,
-		); err != nil {
-			log.Println(
-				"Ошибка сохранения payment_id:",
-				err,
-			)
-
-			msg := tgbotapi.NewMessage(
-				message.Chat.ID,
-				"Платёж создан, но произошла техническая ошибка. "+
-					"Пожалуйста, обратитесь в поддержку.",
-			)
-
-			if _, err := bot.Send(msg); err != nil {
-				log.Println("Ошибка отправки:", err)
-			}
-
-			return
-		}
-
-		// Кнопка оплаты.
-		button := tgbotapi.NewInlineKeyboardButtonURL(
-			"💳 Оплатить 99 ₽",
-			payment.Confirmation.ConfirmationURL,
-		)
-
-		keyboard := tgbotapi.NewInlineKeyboardMarkup(
-			tgbotapi.NewInlineKeyboardRow(button),
-		)
-
-		text := "Заказ создан ✅\n\n" +
-			"Сумма: 99 ₽\n" +
-			"E-mail: " + email + "\n\n" +
-			"Нажмите кнопку ниже, чтобы перейти к оплате."
-
-		msg := tgbotapi.NewMessage(
-			message.Chat.ID,
-			text,
-		)
-
-		msg.ReplyMarkup = keyboard
-
-		if _, err := bot.Send(msg); err != nil {
-			log.Println("Ошибка отправки:", err)
-		}
 
 		return
 	}
@@ -252,21 +149,24 @@ func handleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 	// Команды
 	// --------------------------------------------------------
 
-	switch message.Text {
+	switch {
 
-	case "/start":
+	case message.Text == "/start":
 		sendStartMessage(bot, message.Chat.ID)
 
-	case "/buy":
-		sendPurchaseMessage(bot, message.Chat.ID)
+	case message.Text == "/buy":
+		sendAgeGroupMenu(bot, message.Chat.ID)
 
-	case "/help":
+	case message.Text == "/help":
 		sendHelpMessage(bot, message.Chat.ID)
 
-	case "/testlink":
-		sendTestInviteLink(bot, message.Chat.ID)
+	case strings.HasPrefix(message.Text, "/testlink"):
+		productID := strings.TrimSpace(
+			strings.TrimPrefix(message.Text, "/testlink"),
+		)
+		sendTestInviteLink(bot, message.Chat.ID, productID)
 
-	case "/status":
+	case message.Text == "/status":
 		sendStatusMessage(bot, message.Chat.ID)
 	}
 }
@@ -281,13 +181,13 @@ func sendStartMessage(
 ) {
 	text := "Привет! 👋\n\n" +
 		"Добро пожаловать в «Карманный воспитатель».\n\n" +
-		"Закрытый канал «" + productName + "» — доступ к материалам для родителей детей 8–10 лет.\n\n" +
-		"Стоимость доступа: " + productPrice + "\n\n" +
-		"После успешной оплаты вы получите персональную ссылку для входа в закрытый канал."
+		"У нас есть закрытые каналы с материалами для родителей — " +
+		"подобраны по возрасту ребёнка, на разный срок доступа.\n\n" +
+		"Выберите возраст ребёнка, чтобы посмотреть варианты и оформить доступ."
 
 	button := tgbotapi.NewInlineKeyboardButtonData(
 		"Получить доступ",
-		"buy",
+		"choose_age",
 	)
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
@@ -307,32 +207,180 @@ func sendStartMessage(
 }
 
 // ============================================================
-// ПОКУПКА
+// ШАГ 1: ВЫБОР ВОЗРАСТА
 // ============================================================
 
-func sendPurchaseMessage(
+func sendAgeGroupMenu(
 	bot *tgbotapi.BotAPI,
 	chatID int64,
 ) {
-	text := "Доступ в закрытый канал\n\n" +
-		"«" + productName + "»\n\n" +
-		"Стоимость: " + productPrice + "\n\n" +
-		"После оплаты бот автоматически проверит платёж и предоставит доступ к каналу."
+	text := "Выберите возраст ребёнка:"
 
-	button := tgbotapi.NewInlineKeyboardButtonData(
-		"Оплатить 99 ₽",
-		"pay",
+	var rows [][]tgbotapi.InlineKeyboardButton
+
+	for _, group := range ageGroups() {
+		button := tgbotapi.NewInlineKeyboardButtonData(
+			group.Label,
+			"age:"+group.Slug,
+		)
+
+		rows = append(
+			rows,
+			tgbotapi.NewInlineKeyboardRow(button),
+		)
+	}
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = keyboard
+
+	if _, err := bot.Send(msg); err != nil {
+		log.Println("Ошибка отправки:", err)
+	}
+}
+
+// ============================================================
+// ШАГ 2: ВЫБОР СРОКА ДОСТУПА
+// ============================================================
+
+func sendDurationMenu(
+	bot *tgbotapi.BotAPI,
+	chatID int64,
+	ageSlug string,
+) {
+	items := productsForAgeSlug(ageSlug)
+
+	if len(items) == 0 {
+		msg := tgbotapi.NewMessage(
+			chatID,
+			"Такой возрастной группы не найдено. Попробуйте /buy ещё раз.",
+		)
+
+		if _, err := bot.Send(msg); err != nil {
+			log.Println("Ошибка отправки:", err)
+		}
+
+		return
+	}
+
+	text := "«" + items[0].AgeLabel + "» — выберите срок доступа:"
+
+	var rows [][]tgbotapi.InlineKeyboardButton
+
+	for _, p := range items {
+		label := fmt.Sprintf(
+			"%s — %d ₽",
+			p.DurationLabel,
+			p.PriceRub,
+		)
+
+		button := tgbotapi.NewInlineKeyboardButtonData(
+			label,
+			"buy:"+p.ID,
+		)
+
+		rows = append(
+			rows,
+			tgbotapi.NewInlineKeyboardRow(button),
+		)
+	}
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = keyboard
+
+	if _, err := bot.Send(msg); err != nil {
+		log.Println("Ошибка отправки:", err)
+	}
+}
+
+// ============================================================
+// ШАГ 3: ОФОРМЛЕНИЕ ЗАКАЗА И СОЗДАНИЕ ПЛАТЕЖА
+// ============================================================
+
+func startCheckout(
+	bot *tgbotapi.BotAPI,
+	chatID int64,
+	userID int64,
+	productID string,
+	email string,
+) {
+	product := getProductByID(productID)
+
+	orderID, err := createOrder(userID, product.ID, product.PriceRub)
+
+	if err != nil {
+		log.Println("Ошибка создания заказа:", err)
+
+		msg := tgbotapi.NewMessage(
+			chatID,
+			"Не удалось создать заказ. Попробуйте ещё раз.",
+		)
+
+		if _, err := bot.Send(msg); err != nil {
+			log.Println("Ошибка отправки:", err)
+		}
+
+		return
+	}
+
+	if err := updateOrderEmail(orderID, email); err != nil {
+		log.Println("Ошибка сохранения e-mail:", err)
+		// Не критично для оплаты — продолжаем.
+	}
+
+	payment, err := createYooKassaPayment(orderID, product, email)
+
+	if err != nil {
+		log.Println("Ошибка создания платежа ЮKassa:", err)
+
+		msg := tgbotapi.NewMessage(
+			chatID,
+			"Не удалось создать платёж. 😔\n\n"+
+				"Попробуйте ещё раз через некоторое время.",
+		)
+
+		if _, err := bot.Send(msg); err != nil {
+			log.Println("Ошибка отправки:", err)
+		}
+
+		return
+	}
+
+	if err := updateYooKassaPaymentID(orderID, payment.ID); err != nil {
+		log.Println("Ошибка сохранения payment_id:", err)
+
+		msg := tgbotapi.NewMessage(
+			chatID,
+			"Платёж создан, но произошла техническая ошибка. "+
+				"Пожалуйста, обратитесь в поддержку.",
+		)
+
+		if _, err := bot.Send(msg); err != nil {
+			log.Println("Ошибка отправки:", err)
+		}
+
+		return
+	}
+
+	button := tgbotapi.NewInlineKeyboardButtonURL(
+		fmt.Sprintf("💳 Оплатить %d ₽", product.PriceRub),
+		payment.Confirmation.ConfirmationURL,
 	)
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(button),
 	)
 
-	msg := tgbotapi.NewMessage(
-		chatID,
-		text,
-	)
+	text := "Заказ создан ✅\n\n" +
+		"Курс: " + product.Title + "\n" +
+		fmt.Sprintf("Сумма: %d ₽\n", product.PriceRub) +
+		"E-mail для чека: " + email + "\n\n" +
+		"Нажмите кнопку ниже, чтобы перейти к оплате."
 
+	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ReplyMarkup = keyboard
 
 	if _, err := bot.Send(msg); err != nil {
@@ -348,25 +396,30 @@ func handleButton(
 	bot *tgbotapi.BotAPI,
 	callback *tgbotapi.CallbackQuery,
 ) {
-	switch callback.Data {
+	data := callback.Data
 
-	case "buy":
-		sendPurchaseMessage(
-			bot,
-			callback.Message.Chat.ID,
-		)
+	switch {
 
-	case "pay":
+	case data == "choose_age":
+		sendAgeGroupMenu(bot, callback.Message.Chat.ID)
 
-		// Теперь бот ждёт e-mail.
-		awaitingEmail[callback.From.ID] = true
+	case strings.HasPrefix(data, "age:"):
+		ageSlug := strings.TrimPrefix(data, "age:")
+		sendDurationMenu(bot, callback.Message.Chat.ID, ageSlug)
+
+	case strings.HasPrefix(data, "buy:"):
+		productID := strings.TrimPrefix(data, "buy:")
+
+		// Запоминаем выбранный курс и просим e-mail —
+		// он обязателен для чека (54-ФЗ, требование ЮKassa).
+		awaitingEmail[callback.From.ID] = productID
 
 		msg := tgbotapi.NewMessage(
 			callback.Message.Chat.ID,
-			"📧 Для оформления оплаты введите ваш e-mail.\n\n"+
-				"На него ЮKassa отправит электронный чек после оплаты.\n\n"+
-				"Например:\n"+
-				"example@mail.ru",
+			"📧 Остался последний шаг — укажите e-mail для чека.\n\n"+
+				"ЮKassa отправит на него электронную квитанцию "+
+				"после оплаты.\n\n"+
+				"Например:\nexample@mail.ru",
 		)
 
 		if _, err := bot.Send(msg); err != nil {
@@ -447,9 +500,12 @@ func sendStatusMessage(
 	}
 
 	if order.InviteLink != "" {
+		product := getProductByID(order.ProductID)
+
 		msg := tgbotapi.NewMessage(
 			chatID,
 			"Оплата подтверждена ✅\n\n"+
+				"Курс: "+product.Title+"\n\n"+
 				"Ваш доступ в канал:\n\n"+
 				order.InviteLink,
 		)
@@ -510,272 +566,12 @@ func sendStatusMessage(
 }
 
 // ============================================================
-// WEBHOOK ЮKASSA
-// ============================================================
-
-func webhookHandler(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
-	if r.Method != http.MethodPost {
-		http.Error(
-			w,
-			"Method Not Allowed",
-			http.StatusMethodNotAllowed,
-		)
-
-		return
-	}
-
-	defer r.Body.Close()
-
-	// Структура уведомления ЮKassa.
-	var notification struct {
-		Type  string `json:"type"`
-		Event string `json:"event"`
-
-		Object struct {
-			ID     string `json:"id"`
-			Status string `json:"status"`
-			Paid   bool   `json:"paid"`
-		} `json:"object"`
-	}
-
-	if err := json.NewDecoder(
-		r.Body,
-	).Decode(&notification); err != nil {
-
-		log.Println(
-			"Ошибка разбора webhook:",
-			err,
-		)
-
-		http.Error(
-			w,
-			"Bad Request",
-			http.StatusBadRequest,
-		)
-
-		return
-	}
-
-	log.Printf(
-		"Webhook: type=%s event=%s payment_id=%s status=%s",
-		notification.Type,
-		notification.Event,
-		notification.Object.ID,
-		notification.Object.Status,
-	)
-
-	// Нас интересует только успешная оплата.
-	if notification.Event != "payment.succeeded" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	paymentID := notification.Object.ID
-
-	if paymentID == "" {
-		log.Println("Webhook не содержит payment_id")
-
-		http.Error(
-			w,
-			"Payment ID missing",
-			http.StatusBadRequest,
-		)
-
-		return
-	}
-
-	// --------------------------------------------------------
-	// 1. Проверяем платёж напрямую через API ЮKassa.
-	// --------------------------------------------------------
-
-	payment, err := getYooKassaPayment(paymentID)
-
-	if err != nil {
-		log.Println(
-			"Не удалось проверить платёж:",
-			err,
-		)
-
-		http.Error(
-			w,
-			"Payment verification failed",
-			http.StatusInternalServerError,
-		)
-
-		return
-	}
-
-	if payment.Status != "succeeded" || !payment.Paid {
-		log.Printf(
-			"Платёж %s не подтверждён: status=%s paid=%v",
-			paymentID,
-			payment.Status,
-			payment.Paid,
-		)
-
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// --------------------------------------------------------
-	// 2. Ищем наш заказ по payment_id.
-	// --------------------------------------------------------
-
-	order, err := getOrderByPaymentID(paymentID)
-
-	if err != nil {
-		log.Println(
-			"Заказ для payment_id не найден:",
-			err,
-		)
-
-		http.Error(
-			w,
-			"Order not found",
-			http.StatusInternalServerError,
-		)
-
-		return
-	}
-
-	log.Printf(
-		"Найден заказ: order=%s user=%d status=%s",
-		order.OrderID,
-		order.TelegramUserID,
-		order.Status,
-	)
-
-	// --------------------------------------------------------
-	// 3. Защита от повторного webhook.
-	// --------------------------------------------------------
-
-	if order.InviteLink != "" {
-		log.Printf(
-			"Доступ уже выдан для заказа %s",
-			order.OrderID,
-		)
-
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// --------------------------------------------------------
-	// 4. Помечаем заказ как оплаченный.
-	// --------------------------------------------------------
-
-	if err := updateOrderStatus(
-		order.OrderID,
-		"paid",
-	); err != nil {
-
-		log.Println(
-			"Ошибка обновления статуса заказа:",
-			err,
-		)
-
-		http.Error(
-			w,
-			"Database error",
-			http.StatusInternalServerError,
-		)
-
-		return
-	}
-
-	// --------------------------------------------------------
-	// 5. Создаём персональную invite-ссылку.
-	// --------------------------------------------------------
-
-	inviteLink, err := createChannelInviteLink(
-		botInstance,
-	)
-
-	if err != nil {
-		log.Println(
-			"Ошибка создания invite link:",
-			err,
-		)
-
-		http.Error(
-			w,
-			"Invite link error",
-			http.StatusInternalServerError,
-		)
-
-		return
-	}
-
-	// --------------------------------------------------------
-	// 6. Сохраняем invite-ссылку в базе.
-	// --------------------------------------------------------
-
-	if err := updateInviteLink(
-		order.OrderID,
-		inviteLink,
-	); err != nil {
-
-		log.Println(
-			"Ошибка сохранения invite link:",
-			err,
-		)
-
-		http.Error(
-			w,
-			"Database error",
-			http.StatusInternalServerError,
-		)
-
-		return
-	}
-
-	// --------------------------------------------------------
-	// 7. Отправляем ссылку покупателю.
-	// --------------------------------------------------------
-
-	text := "Оплата получена! 🎉\n\n" +
-		"Спасибо за покупку «Карманного воспитателя».\n\n" +
-		"Ваш персональный доступ в закрытый канал:\n\n" +
-		inviteLink + "\n\n" +
-		"Ссылка предназначена только для вас."
-
-	msg := tgbotapi.NewMessage(
-		order.TelegramUserID,
-		text,
-	)
-
-	if _, err := botInstance.Send(msg); err != nil {
-
-		log.Println(
-			"Ошибка отправки ссылки пользователю:",
-			err,
-		)
-
-		// Важно:
-		// платёж уже подтверждён,
-		// а invite-ссылка уже сохранена в БД.
-		// Поэтому здесь не возвращаем ошибку ЮKassa.
-	}
-
-	log.Printf(
-		"ДОСТУП ВЫДАН: order=%s user=%d invite=%s",
-		order.OrderID,
-		order.TelegramUserID,
-		inviteLink,
-	)
-
-	// Сообщаем ЮKassa, что webhook обработан.
-	w.WriteHeader(http.StatusOK)
-}
-
-// ============================================================
 // СОЗДАНИЕ INVITE-ССЫЛКИ TELEGRAM
 // ============================================================
 
 func createChannelInviteLink(
 	bot *tgbotapi.BotAPI,
+	channelID int64,
 ) (string, error) {
 
 	config := tgbotapi.CreateChatInviteLinkConfig{
@@ -816,11 +612,17 @@ func createChannelInviteLink(
 // ТЕСТ INVITE-ССЫЛКИ
 // ============================================================
 
+// productID можно передать аргументом команды, например:
+// "/testlink 8_10_1m". Если аргумент не указан — тестируется
+// legacyProduct (тот же канал, что был единственным раньше).
 func sendTestInviteLink(
 	bot *tgbotapi.BotAPI,
 	chatID int64,
+	productID string,
 ) {
-	inviteLink, err := createChannelInviteLink(bot)
+	product := getProductByID(productID)
+
+	inviteLink, err := createChannelInviteLink(bot, product.ChannelID)
 
 	if err != nil {
 
@@ -842,7 +644,8 @@ func sendTestInviteLink(
 	}
 
 	text := "Тестовая ссылка создана ✅\n\n" +
-		"Вот ссылка на закрытый канал:\n" +
+		"Курс: " + product.Title + "\n" +
+		"Ссылка на канал:\n" +
 		inviteLink
 
 	msg := tgbotapi.NewMessage(
@@ -999,8 +802,11 @@ func processSuccessfulPayment(
 		return
 	}
 
+	// Определяем, к какому каналу нужен доступ.
+	product := getProductByID(order.ProductID)
+
 	// Создаём персональную ссылку.
-	inviteLink, err := createChannelInviteLink(bot)
+	inviteLink, err := createChannelInviteLink(bot, product.ChannelID)
 
 	if err != nil {
 		log.Printf(
@@ -1029,7 +835,7 @@ func processSuccessfulPayment(
 
 	// Отправляем пользователю.
 	text := "Оплата получена! 🎉\n\n" +
-		"Спасибо за покупку «Карманного воспитателя».\n\n" +
+		"Спасибо за покупку курса «" + product.Title + "».\n\n" +
 		"Ваш персональный доступ в закрытый канал:\n\n" +
 		inviteLink + "\n\n" +
 		"Нажмите на ссылку, чтобы присоединиться к каналу."

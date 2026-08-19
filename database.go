@@ -53,7 +53,10 @@ func initDatabase() error {
 	// если её ещё нет.
 	//
 
-	var columnExists bool
+	var (
+		hasInviteLink bool
+		hasProductID  bool
+	)
 
 	rows, err := db.Query(`PRAGMA table_info(orders)`)
 	if err != nil {
@@ -62,11 +65,11 @@ func initDatabase() error {
 
 	for rows.Next() {
 		var (
-			cid       int
-			name      string
-			dataType  string
-			notNull   int
-			defaultV  interface{}
+			cid        int
+			name       string
+			dataType   string
+			notNull    int
+			defaultV   interface{}
 			primaryKey int
 		)
 
@@ -82,15 +85,17 @@ func initDatabase() error {
 			return err
 		}
 
-		if name == "invite_link" {
-			columnExists = true
-			break
+		switch name {
+		case "invite_link":
+			hasInviteLink = true
+		case "product_id":
+			hasProductID = true
 		}
 	}
 
 	rows.Close()
 
-	if !columnExists {
+	if !hasInviteLink {
 		_, err := db.Exec(`
 			ALTER TABLE orders
 			ADD COLUMN invite_link TEXT
@@ -106,6 +111,26 @@ func initDatabase() error {
 		fmt.Println("База данных обновлена: добавлено поле invite_link")
 	}
 
+	// product_id — какой из 12 курсов купил пользователь.
+	// У старых заказов (созданных до появления каталога) это поле
+	// будет пустым — на такой случай в processSuccessfulPayment
+	// есть запасной вариант (legacyProduct).
+	if !hasProductID {
+		_, err := db.Exec(`
+			ALTER TABLE orders
+			ADD COLUMN product_id TEXT
+		`)
+
+		if err != nil {
+			return fmt.Errorf(
+				"не удалось добавить product_id: %w",
+				err,
+			)
+		}
+
+		fmt.Println("База данных обновлена: добавлено поле product_id")
+	}
+
 	return nil
 }
 
@@ -113,7 +138,11 @@ func initDatabase() error {
 // СОЗДАНИЕ ЗАКАЗА
 // ============================================================
 
-func createOrder(telegramUserID int64) (string, error) {
+func createOrder(
+	telegramUserID int64,
+	productID string,
+	amount int,
+) (string, error) {
 	orderID := fmt.Sprintf(
 		"order_%d_%d",
 		telegramUserID,
@@ -126,14 +155,16 @@ func createOrder(telegramUserID int64) (string, error) {
 			telegram_user_id,
 			amount,
 			status,
+			product_id,
 			created_at
 		)
-		VALUES (?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?)
 	`,
 		orderID,
 		telegramUserID,
-		99,
+		amount,
 		"pending",
+		productID,
 		time.Now(),
 	)
 
@@ -204,6 +235,7 @@ type Order struct {
 	YooKassaPaymentID string
 	CustomerEmail     string
 	InviteLink        string
+	ProductID         string
 }
 
 // ============================================================
@@ -224,7 +256,8 @@ func getOrderByPaymentID(
 			status,
 			yookassa_payment_id,
 			customer_email,
-			COALESCE(invite_link, '')
+			COALESCE(invite_link, ''),
+			COALESCE(product_id, '')
 		FROM orders
 		WHERE yookassa_payment_id = ?
 		LIMIT 1
@@ -236,6 +269,7 @@ func getOrderByPaymentID(
 		&order.YooKassaPaymentID,
 		&order.CustomerEmail,
 		&order.InviteLink,
+		&order.ProductID,
 	)
 
 	if err != nil {
@@ -275,7 +309,8 @@ func getOrdersToCheck() ([]Order, error) {
 			status,
 			yookassa_payment_id,
 			COALESCE(customer_email, ''),
-			COALESCE(invite_link, '')
+			COALESCE(invite_link, ''),
+			COALESCE(product_id, '')
 		FROM orders
 		WHERE
 			yookassa_payment_id IS NOT NULL
@@ -307,6 +342,7 @@ func getOrdersToCheck() ([]Order, error) {
 			&order.YooKassaPaymentID,
 			&order.CustomerEmail,
 			&order.InviteLink,
+			&order.ProductID,
 		); err != nil {
 			return nil, err
 		}
@@ -339,7 +375,8 @@ func getLastOrderByUserID(
 			status,
 			COALESCE(yookassa_payment_id, ''),
 			COALESCE(customer_email, ''),
-			COALESCE(invite_link, '')
+			COALESCE(invite_link, ''),
+			COALESCE(product_id, '')
 		FROM orders
 		WHERE telegram_user_id = ?
 		ORDER BY created_at DESC
@@ -352,6 +389,7 @@ func getLastOrderByUserID(
 		&order.YooKassaPaymentID,
 		&order.CustomerEmail,
 		&order.InviteLink,
+		&order.ProductID,
 	)
 
 	if err != nil {

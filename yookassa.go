@@ -32,6 +32,7 @@ type YooKassaPaymentResponse struct {
 
 func createYooKassaPayment(
 	orderID string,
+	product Product,
 	email string,
 ) (*YooKassaPaymentResponse, error) {
 
@@ -46,9 +47,11 @@ func createYooKassaPayment(
 		return nil, fmt.Errorf("YOOKASSA_SECRET_KEY не установлен")
 	}
 
+	amountValue := fmt.Sprintf("%d.00", product.PriceRub)
+
 	requestBody := map[string]interface{}{
 		"amount": map[string]string{
-			"value":    "99.00",
+			"value":    amountValue,
 			"currency": "RUB",
 		},
 
@@ -59,12 +62,17 @@ func createYooKassaPayment(
 			"return_url": "https://t.me/karmannyi_bot",
 		},
 
-		"description": "Доступ в канал «8–10 лет Карманный воспитатель»",
+		"description": "Доступ в канал «" + product.Title + "»",
 
 		"metadata": map[string]string{
-			"order_id": orderID,
+			"order_id":   orderID,
+			"product_id": product.ID,
 		},
 
+		// У этого магазина в ЮKassa обязательна фискализация чеков
+		// (54-ФЗ) — без блока receipt API отвечает ошибкой
+		// "Receipt is missing or illegal". Поэтому email собирается
+		// в боте и передаётся сюда.
 		"receipt": map[string]interface{}{
 			"customer": map[string]string{
 				"email": email,
@@ -72,17 +80,17 @@ func createYooKassaPayment(
 
 			"items": []map[string]interface{}{
 				{
-					"description": "Доступ в канал «8–10 лет Карманный воспитатель»",
+					"description": product.Title,
 
 					"quantity": 1,
 
 					"amount": map[string]string{
-						"value":    "99.00",
+						"value":    amountValue,
 						"currency": "RUB",
 					},
 
-					"vat_code":       11,
-					"payment_mode":  "full_payment",
+					"vat_code":        11,
+					"payment_mode":    "full_payment",
 					"payment_subject": "service",
 				},
 			},
