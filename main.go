@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"net/mail"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -49,7 +51,17 @@ func main() {
 	}
 
 	// Создаём Telegram-бота.
-	bot, err := tgbotapi.NewBotAPI(token)
+	//
+	// Если задана переменная TELEGRAM_PROXY_URL — все запросы к Telegram
+	// (включая long polling) идут через этот прокси. Это нужно, когда
+	// сам бот работает на сервере в России, а Telegram из России
+	// замедлен/ограничен Роскомнадзором: запросы к api.telegram.org
+	// заворачиваются на маленький сервер за границей.
+	//
+	// Формат: http://логин:пароль@ip_прокси:порт
+	// Если переменная не задана — бот стучится в Telegram напрямую
+	// (обычное поведение, как раньше).
+	bot, err := newTelegramBot(token)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -93,6 +105,48 @@ func main() {
 			handleButton(bot, update.CallbackQuery)
 		}
 	}
+}
+
+// ============================================================
+// СОЗДАНИЕ TELEGRAM-БОТА (С ПОДДЕРЖКОЙ ПРОКСИ)
+// ============================================================
+
+// newTelegramBot создаёт tgbotapi.BotAPI. Если задана переменная
+// окружения TELEGRAM_PROXY_URL, все HTTP-запросы к Telegram
+// (в том числе long polling) идут через указанный HTTP(S)-прокси.
+// Формат значения: http://логин:пароль@ip_прокси:порт
+func newTelegramBot(token string) (*tgbotapi.BotAPI, error) {
+	proxyRaw := os.Getenv("TELEGRAM_PROXY_URL")
+
+	if proxyRaw == "" {
+		return tgbotapi.NewBotAPI(token)
+	}
+
+	proxyURL, err := url.Parse(proxyRaw)
+
+	if err != nil {
+		return nil, fmt.Errorf(
+			"некорректный TELEGRAM_PROXY_URL: %w",
+			err,
+		)
+	}
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		},
+		// Long polling ждёт обновления до 60 секунд (см. u.Timeout
+		// ниже) — таймаут клиента должен быть заведомо больше.
+		Timeout: 90 * time.Second,
+	}
+
+	log.Println("Telegram: используется прокси", proxyURL.Host)
+
+	return tgbotapi.NewBotAPIWithClient(
+		token,
+		tgbotapi.APIEndpoint,
+		client,
+	)
 }
 
 // ============================================================
@@ -168,6 +222,9 @@ func handleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 
 	case message.Text == "/status":
 		sendStatusMessage(bot, message.Chat.ID)
+
+	case message.Text == "/relink":
+		sendFreshInviteLink(bot, message.Chat.ID, message.From.ID)
 	}
 }
 
@@ -446,7 +503,9 @@ func sendHelpMessage(
 	chatID int64,
 ) {
 	text := "Помощь\n\n" +
-		"Если у вас возникли вопросы с оплатой или доступом к каналу, воспользуйтесь командой /status или обратитесь в поддержку."
+		"/status — статус вашего последнего заказа\n" +
+		"/relink — получить новую ссылку на канал, если старая не сработала (истекла, была использована и т.п.)\n\n" +
+		"Если у вас возникли вопросы с оплатой или доступом к каналу, обратитесь в поддержку."
 
 	msg := tgbotapi.NewMessage(
 		chatID,
@@ -566,8 +625,93 @@ func sendStatusMessage(
 }
 
 // ============================================================
-// СОЗДАНИЕ INVITE-ССЫЛКИ TELEGRAM
+// ПЕРЕВЫПУСК INVITE-ССЫЛКИ (/relink)
 // ============================================================
+//
+// Если у пользователя оплаченный заказ, но старая ссылка почему-то
+// не сработала (истекла, была отозвана, technical glitch и т.п.) —
+// эта команда создаёт НОВУЮ ссылку для того же заказа, без повторной
+// оплаты. Полезно и как самопомощь пользователю, и как способ
+// проверить, воспроизводится ли проблема на свежей ссылке.
+
+func sendFreshInviteLink(
+	bot *tgbotapi.BotAPI,
+	chatID int64,
+	userID int64,
+) {
+	order, err := getLastOrderByUserID(userID)
+
+	if err != nil {
+		msg := tgbotapi.NewMessage(
+			chatID,
+			"Заказов пока нет. Оформите доступ командой /buy.",
+		)
+
+		if _, err := bot.Send(msg); err != nil {
+			log.Println("Ошибка отправки:", err)
+		}
+
+		return
+	}
+
+	if order.Status != "paid" {
+		msg := tgbotapi.NewMessage(
+			chatID,
+			"Команда доступна только для оплаченных заказов.\n\n"+
+				"Проверьте статус: /status",
+		)
+
+		if _, err := bot.Send(msg); err != nil {
+			log.Println("Ошибка отправки:", err)
+		}
+
+		return
+	}
+
+	product := getProductByID(order.ProductID)
+
+	inviteLink, err := createChannelInviteLink(bot, product.ChannelID)
+
+	if err != nil {
+		log.Printf(
+			"Не удалось перевыпустить invite-ссылку для заказа %s: %v",
+			order.OrderID,
+			err,
+		)
+
+		msg := tgbotapi.NewMessage(
+			chatID,
+			"Не удалось создать новую ссылку. Попробуйте ещё раз "+
+				"через некоторое время или обратитесь в поддержку.",
+		)
+
+		if _, err := bot.Send(msg); err != nil {
+			log.Println("Ошибка отправки:", err)
+		}
+
+		return
+	}
+
+	if err := updateInviteLink(order.OrderID, inviteLink); err != nil {
+		log.Printf(
+			"Не удалось сохранить новую invite-ссылку для заказа %s: %v",
+			order.OrderID,
+			err,
+		)
+	}
+
+	text := "Новая ссылка создана ✅\n\n" +
+		"Курс: " + product.Title + "\n\n" +
+		"Ссылка действительна 24 часа и одноразовая — " +
+		"переходите сразу:\n\n" +
+		inviteLink
+
+	msg := tgbotapi.NewMessage(chatID, text)
+
+	if _, err := bot.Send(msg); err != nil {
+		log.Println("Ошибка отправки:", err)
+	}
+}
 
 func createChannelInviteLink(
 	bot *tgbotapi.BotAPI,
@@ -583,6 +727,12 @@ func createChannelInviteLink(
 
 		// Одна ссылка = максимум один вошедший пользователь.
 		MemberLimit: 1,
+
+		// Явный срок действия — 24 часа с момента создания.
+		// Раньше это поле не задавалось вовсе (ссылка не истекала
+		// по времени), что не совпадало с ожиданиями и затрудняло
+		// диагностику проблем со ссылками.
+		ExpireDate: int(time.Now().Add(24 * time.Hour).Unix()),
 	}
 
 	response, err := bot.Request(config)
